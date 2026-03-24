@@ -174,7 +174,7 @@ class DataManager:
             states=states,  # Use specified states or default (CA, NY, FL)
             year=2018,
             target="PINCP",
-            root_dir="/data/user_data/mswaroop/Subset-Selection-Code/folktables_data_storage",
+            root_dir='/net/dali/home/mscbio/rul98/PDRO/data_acs',
             seed=seed,
             estimator_type=estimator_type,
             device=device,

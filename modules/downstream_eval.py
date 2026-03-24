@@ -16,7 +16,8 @@ class DownstreamEvaluator:
         self.checkpoint_manager = checkpoint_manager
     
     def evaluate_selections(self, pop_data_test_val, our_method_results, baseline_results, 
-                           budget, seed, is_classification=False, save_path=None):
+                           budget, seed, is_classification=False, save_path=None,
+                           additional_methods=None):
         """Evaluate all selection methods on downstream tasks"""
         # Check if already completed
         if self.checkpoint_manager and self.checkpoint_manager.is_downstream_eval_complete():
@@ -42,7 +43,7 @@ class DownstreamEvaluator:
             results_for_budget = self._evaluate_for_budget(
             pop_data_test_val, train_test_indices, 
             our_method_results, baseline_results,
-            b, seed, is_classification
+            b, seed, is_classification, additional_methods=additional_methods
             )
             all_results[b] = results_for_budget
             
@@ -83,7 +84,7 @@ class DownstreamEvaluator:
     
     def _evaluate_for_budget(self, pop_data_test_val, train_test_indices, 
                            our_method_results, baseline_results, budget, 
-                           seed, is_classification):
+                           seed, is_classification, additional_methods=None):
         """Evaluate all methods for a specific budget"""
         all_downstream_results = []
         
@@ -111,6 +112,26 @@ class DownstreamEvaluator:
                     method_name, seed, is_classification
                 )
                 all_downstream_results.extend(baseline_results_list)
+        
+        # Evaluate any additional user-provided methods.
+        # `additional_methods` can be:
+        #   {"method_name": {"selected_indices": [...]}, ...}
+        # or
+        #   {"method_name": [indices], ...}
+        if additional_methods:
+            for method_name, payload in additional_methods.items():
+                if isinstance(payload, dict):
+                    method_indices = payload.get('selected_indices', [])
+                else:
+                    method_indices = payload
+                method_indices = list(method_indices)[:budget]
+                if len(method_indices) == 0:
+                    continue
+                method_results_list = self._evaluate_method(
+                    pop_data_test_val, train_test_indices, method_indices,
+                    method_name, seed, is_classification
+                )
+                all_downstream_results.extend(method_results_list)
         
         return {
             'budget': budget,

@@ -6,6 +6,52 @@ import numpy as np
 import time
 import math
 from typing import List, Dict, Any, Optional
+import warnings
+
+def _resolve_safe_device(requested_device=None):
+    """
+    Return a working torch.device.
+    - requested_device=None or 'auto': prefer CUDA if a real CUDA op works.
+    - requested_device='cuda': try CUDA, but fall back to CPU if probe fails.
+    - requested_device='cpu': force CPU.
+    """
+    if requested_device is None:
+        requested_device = "auto"
+
+    requested_device = str(requested_device).lower()
+
+    if requested_device == "cpu":
+        return torch.device("cpu")
+
+    if requested_device in ("auto", "cuda"):
+        if torch.cuda.is_available():
+            try:
+                # Probe with a real CUDA tensor op, not just is_available()
+                _ = torch.ones(1, device="cuda")
+                torch.cuda.synchronize()
+                return torch.device("cuda")
+            except Exception as e:
+                warnings.warn(
+                    f"CUDA detected but unusable ({type(e).__name__}: {e}). "
+                    "Falling back to CPU."
+                )
+                return torch.device("cpu")
+        else:
+            return torch.device("cpu")
+
+    # Allow explicit things like 'cuda:0'
+    try:
+        dev = torch.device(requested_device)
+        if dev.type == "cuda":
+            _ = torch.ones(1, device=dev)
+            torch.cuda.synchronize()
+        return dev
+    except Exception as e:
+        warnings.warn(
+            f"Requested device '{requested_device}' is unusable "
+            f"({type(e).__name__}: {e}). Falling back to CPU."
+        )
+        return torch.device("cpu")
 
 class VariableSelector:
     def __init__(self, checkpoint_manager=None):
@@ -99,15 +145,15 @@ class VariableSelector:
         raise ValueError(f"Unknown penalty_type: {penalty_type}")
 
     def run_selection(self, pop_data, m1, m, budget, params):
-        """Run our variable selection method with checkpointing"""
+        """Run Swaroop’s variable selection method with checkpointing"""
         # Check if already completed
         if self.checkpoint_manager and self.checkpoint_manager.is_our_method_complete():
-            print("Our method already completed. Loading results...")
+            print("Swaroop’s method already completed. Loading results...")
             results = self.checkpoint_manager.load_checkpoint('our_method')
             if results:
                 return results
             else:
-                print("Could not load checkpoint. Re-running our method.")
+                print("Could not load checkpoint. Re-running Swaroop’s method.")
                 
         # Extract parameters from params dict
         save_path = params.get('save_path', './results/')
@@ -126,11 +172,13 @@ class VariableSelector:
         objective_value_estimator = params.get('objective_value_estimator', 'if')
         base_model_type = params.get('base_model_type', 'rf')
         
-        print(f"Starting our variable selection method...")
+        print(f"Starting Swaroop’s variable selection method...")
         start_time = time.time()
         
         # Initialize parameters, optimizer, etc.
-        device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+        # device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+        device = _resolve_safe_device(params.get("device", "auto"))
+        print(f"Using device: {device}")
         
         if params.get('alpha_init') == 'adaptive':
             # Combine data from all populations for adaptive initialization
@@ -511,15 +559,15 @@ class VariableSelector:
         raise ValueError(f"Unknown penalty_type: {penalty_type}")
 
     def run_selection(self, pop_data, m1, m, budget, params):
-        """Run our variable selection method with checkpointing"""
+        """Run Swaroop’s variable selection method with checkpointing"""
         # Check if already completed
         if self.checkpoint_manager and self.checkpoint_manager.is_our_method_complete():
-            print("Our method already completed. Loading results...")
+            print("Swaroop’s method already completed. Loading results...")
             results = self.checkpoint_manager.load_checkpoint('our_method')
             if results:
                 return results
             else:
-                print("Could not load checkpoint. Re-running our method.")
+                print("Could not load checkpoint. Re-running Swaroop’s method.")
                 
         # Extract parameters from params dict
         save_path = params.get('save_path', './results/')
@@ -538,11 +586,13 @@ class VariableSelector:
         objective_value_estimator = params.get('objective_value_estimator', 'if')
         base_model_type = params.get('base_model_type', 'rf')
         
-        print(f"Starting our variable selection method...")
+        print(f"Starting Swaroop’s variable selection method...")
         start_time = time.time()
         
         # Initialize parameters, optimizer, etc.
-        device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+        # device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+        device = _resolve_safe_device(params.get("device", "auto"))
+        print(f"Using device: {device}")
         
         if params.get('alpha_init') == 'adaptive':
             # Combine data from all populations for adaptive initialization

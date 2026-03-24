@@ -1,7 +1,7 @@
 # baselines.py
 import os
 from sklearn.linear_model import Lasso, LogisticRegression
-from sklearn.metrics import log_loss, accuracy_score, LogisticRegression
+# from sklearn.metrics import log_loss, accuracy_score, LogisticRegression
 from sklearn.metrics import log_loss, accuracy_score
 import xgboost as xgb 
 from typing import List, Dict, Any, Tuple, Optional
@@ -110,25 +110,27 @@ def baseline_lasso_comparison(
     best_metric = float('inf')  # Lower is better for MSE and log loss
 
     for current_alpha in lasso_alphas_to_try:
-        model = Lasso(alpha=current_alpha, fit_intercept=False, max_iter=10000, tol=1e-4)
-        model.fit(X_std, Y_std)
-        
-        # Get coefficients and selected features
         if classification:
-            coeffs = model.coef_[0]  # For binary classification
-        else:
-            coeffs = model.coef_
-            
-        selected_idx = np.argsort(np.abs(coeffs))[-budget:]
-        
-        # Calculate prediction metric based on task type
-        if classification:
-            # Use log loss for classification
+            # Use L1-regularized logistic regression for classification
+            model = LogisticRegression(
+                penalty="l1",
+                C=1.0 / current_alpha,   # inverse of regularization strength
+                fit_intercept=False,
+                solver="liblinear",      # good for binary + L1
+                max_iter=10000
+            )
+            model.fit(X_std, Y_pooled)   # use raw class labels, not Y_std
+            coeffs = model.coef_[0]   # binary classification: shape (1, n_features)
+            selected_idx = np.argsort(np.abs(coeffs))[-budget:]
             y_pred_proba = model.predict_proba(X_std)
-            prediction_metric = log_loss(Y_std, y_pred_proba)
-            accuracy = accuracy_score(Y_std, model.predict(X_std))
+            prediction_metric = log_loss(Y_pooled, y_pred_proba)
+            accuracy = accuracy_score(Y_pooled, model.predict(X_std))
         else:
-            # Use MSE for regression
+            # Use Lasso for regression
+            model = Lasso(alpha=current_alpha, fit_intercept=False, max_iter=10000, tol=1e-4)
+            model.fit(X_std, Y_std)
+            coeffs = model.coef_
+            selected_idx = np.argsort(np.abs(coeffs))[-budget:]
             prediction_metric = mean_squared_error(Y_std, model.predict(X_std))
             accuracy = None
         
@@ -274,8 +276,8 @@ def baseline_dro_lasso_comparison(
 ) -> Dict[str, Any]:
     """
     Run DRO Lasso/LogisticRegression comparison on pop_data.
-    Uses a min-max approach focusing on worst-case performance across populations.
-    For classification, uses LogisticRegression with L1 penalty.
+    Uses a min-max style reweighting loop that focuses on worst-case population loss.
+    For classification, uses L1-regularized LogisticRegression.
     """
     if seed is not None:
         np.random.seed(seed)
@@ -287,26 +289,57 @@ def baseline_dro_lasso_comparison(
     # Get population data
     population_data = []
     for pop in pop_data:
-        X_std, Y_std, _, _, _, _ = standardize_data(pop['X_raw'], pop['Y_raw'], classification=classification)
-        population_data.append((X_std, Y_std))
-    
-    meaningful_indices_list = [pop['meaningful_indices'] for pop in pop_data]
+        X_proc, y_proc, _, _, _, _ = standardize_data(
+            pop["X_raw"],
+            pop["Y_raw"],
+            classification=classification
+        )
+        X_proc = np.asarray(X_proc)
+        y_proc = np.asarray(y_proc).ravel()
+        if classification:
+            # LogisticRegression expects raw class labels, not standardized targets.
+            y_proc = y_proc.astype(int)
+        population_data.append((X_proc, y_proc))
+
+    meaningful_indices_list = [pop.get("meaningful_indices") for pop in pop_data]
     best_lasso_f1 = -1.0
     best_prediction_max_loss = float('inf')
     best_results = {}
-    
+
+    # For stable log_loss calls on per-population splits
+    all_classes = None
+    if classification:
+        all_classes = np.unique(np.hstack([y for _, y in population_data]))
+
     for current_alpha in lasso_alphas_to_try:
-        # Initialize uniform weights for each population
-        pop_weights = np.ones(len(population_data)) / len(population_data)
-        
-        # Initialize model
-        model = Lasso(alpha=current_alpha, fit_intercept=False, max_iter=10000, tol=tol)
-        
-        # DRO iterations
+        pop_weights = np.ones(len(population_data), dtype=float) / len(population_data)
+        if classification:
+            # alpha ~ stronger penalty, while LogisticRegression uses C = inverse strength
+            if current_alpha is None or current_alpha <= 0:
+                C_value = 1e12
+            else:
+                C_value = 1.0 / current_alpha
+            model = LogisticRegression(
+                penalty="l1",
+                C=C_value,
+                fit_intercept=False,
+                solver="liblinear",
+                max_iter=10000,
+                tol=tol
+            )
+        else:
+            model = Lasso(
+                alpha=current_alpha,
+                fit_intercept=False,
+                max_iter=10000,
+                tol=tol
+            )
+
         for _ in range(max_iter):
+            old_weights = pop_weights.copy()
             if classification:
-                # For classification, don't weight the target values
-                # Instead, create a combined dataset with sample weights
+                # Build one combined dataset.
+                # Each population gets total weight w, distributed evenly across its samples.
                 X_all = []
                 Y_all = []
                 sample_weights = []
@@ -314,62 +347,70 @@ def baseline_dro_lasso_comparison(
                 for (X, Y), w in zip(population_data, pop_weights):
                     X_all.append(X)
                     Y_all.append(Y)
-                    # Same weight for all samples in this population
-                    sample_weights.extend([w] * len(Y))
-                
+                    per_sample_weight = w / len(Y)
+                    sample_weights.extend([per_sample_weight] * len(Y))
                 X_all = np.vstack(X_all)
                 Y_all = np.hstack(Y_all)
-                sample_weights = np.array(sample_weights)
-                
-                # Fit with sample_weight parameter
+                sample_weights = np.asarray(sample_weights, dtype=float)
                 model.fit(X_all, Y_all, sample_weight=sample_weights)
             else:
-                # For regression, weight both X and Y directly
-                X_weighted = np.vstack([w * X for (X, _), w in zip(population_data, pop_weights)])
-                Y_weighted = np.hstack([w * Y for (_, Y), w in zip(population_data, pop_weights)])
+                # Weighted regression via row scaling.
+                # For weighted least squares, scale by sqrt(weight), not weight.
+                X_weighted_parts = []
+                Y_weighted_parts = []
+                for (X, Y), w in zip(population_data, pop_weights):
+                    row_scale = np.sqrt(w / len(Y))
+                    X_weighted_parts.append(X * row_scale)
+                    Y_weighted_parts.append(Y * row_scale)
+                X_weighted = np.vstack(X_weighted_parts)
+                Y_weighted = np.hstack(Y_weighted_parts)
                 model.fit(X_weighted, Y_weighted)
-            
-            # Calculate losses for each population
+
+            # Evaluate current model on each population
             population_losses = []
             for X, Y in population_data:
                 if classification:
-                    # Log loss for classification
                     pred_proba = model.predict_proba(X)
-                    loss = log_loss(Y, pred_proba)
+                    loss = log_loss(Y, pred_proba, labels=all_classes)
                 else:
-                    # MSE loss for regression
                     pred = model.predict(X)
-                    loss = np.mean((Y - pred) ** 2)
+                    loss = mean_squared_error(Y, pred)
                 population_losses.append(loss)
-            
-            # Update weights based on losses (exponentiated gradient)
-            updated_weights = pop_weights * np.exp(eta * np.array(population_losses))
-            # Normalize
-            pop_weights = updated_weights / updated_weights.sum()
-            
-            # Check for convergence
-            if np.max(np.abs(updated_weights - pop_weights)) < tol:
+
+            # Exponentiated-gradient update
+            updated_weights = old_weights * np.exp(eta * np.asarray(population_losses, dtype=float))
+            new_weights = updated_weights / updated_weights.sum()
+
+            # Proper convergence check: compare old vs new normalized weights
+            if np.max(np.abs(new_weights - old_weights)) < tol:
+                pop_weights = new_weights
                 break
-        
-        # Get final model and coefficients
+
+            pop_weights = new_weights
+
+        # Final coefficients / selected features
         if classification:
-            coeffs = model.coef_[0]  # Binary classification
+            coeffs = model.coef_[0]   # binary classification
         else:
             coeffs = model.coef_
         selected_idx = np.argsort(np.abs(coeffs))[-budget:]
         
-        # Calculate maximum loss across populations
+        # Final worst-population metric
         if classification:
-            max_loss = max(log_loss(Y, model.predict_proba(X)) for X, Y in population_data)
-            # Also get accuracy for reporting
+            max_loss = max(
+                log_loss(Y, model.predict_proba(X), labels=all_classes)
+                for X, Y in population_data
+            )
             accuracies = [accuracy_score(Y, model.predict(X)) for X, Y in population_data]
             min_accuracy = min(accuracies)
         else:
-            max_loss = max(np.mean((Y - model.predict(X)) ** 2) for X, Y in population_data)
+            max_loss = max(
+                mean_squared_error(Y, model.predict(X))
+                for X, Y in population_data
+            )
             min_accuracy = None
         
         if meaningful_indices_list is None or any(mi is None for mi in meaningful_indices_list):
-            # Use max loss if meaningful indices aren't available
             if max_loss < best_prediction_max_loss:
                 best_prediction_max_loss = max_loss
                 best_results = {
@@ -382,12 +423,11 @@ def baseline_dro_lasso_comparison(
                     'precision': None,
                     'recall': None,
                     'f1_score': None,
-                    'accuracy': min_accuracy,  # Only meaningful for classification
+                    'accuracy': min_accuracy,
                     'max_population_loss': max_loss,
-                    'final_pop_weights': pop_weights.tolist()
+                    'final_pop_weights': pop_weights.tolist(),
                 }
         else:
-            # Calculate F1 score if meaningful indices are available
             sel_set = set(selected_idx)
             true_set = set.union(*(set(mi) for mi in meaningful_indices_list))
             intersect = len(sel_set & true_set)
@@ -396,11 +436,10 @@ def baseline_dro_lasso_comparison(
             f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
             
             if max_loss < best_prediction_max_loss:
-                best_prediction_max_loss = max_loss
-                best_lasso_f1 = f1
                 pop_stats, overall_stats = compute_population_stats(
                     selected_idx.tolist(), meaningful_indices_list
                 )
+                best_prediction_max_loss = max_loss
                 best_results = {
                     'alpha_value': current_alpha,
                     'selected_indices': selected_idx.tolist(),
@@ -411,11 +450,11 @@ def baseline_dro_lasso_comparison(
                     'precision': prec,
                     'recall': rec,
                     'f1_score': f1,
-                    'accuracy': min_accuracy,  # Only meaningful for classification
+                    'accuracy': min_accuracy,
                     'max_population_loss': max_loss,
                     'final_pop_weights': pop_weights.tolist()
                 }
-    
+
     return best_results
 
 
